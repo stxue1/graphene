@@ -14,6 +14,7 @@ import heapq
 import time
 import datetime as dt
 from pytz import timezone
+from collections import deque
 import logging
 
 logging.basicConfig(level=logging.INFO)
@@ -999,11 +1000,11 @@ def test_offline():
     task_ordering = offline.build_schedule(test_graph, m=1, dag_allocation=dag_allocation)
     print([t[0] for t in task_ordering])
     print(len([t[0] for t in task_ordering]))
-    # online = OnlineScheduler(4023, 9600, 100, 0.1, 1, 1, 10)
-    # current_time = 0
-    # while len(task_ordering) != 0:
-    #     scheduled, task_ordering, next_timestamp = online.schedule_tasks(job_name, task_ordering, current_time)
-    #     current_time = next_timestamp
+    online = OnlineScheduler(4023, 9600, 100, 0.1, 1, 1, 10)
+    current_time = 0
+    while len(task_ordering) != 0:
+        scheduled, task_ordering, next_timestamp = online.schedule_tasks(job_name, task_ordering, current_time)
+        current_time = next_timestamp
 
 
 def get_some():
@@ -1036,7 +1037,7 @@ def get_one():
 def test_multiple_offline():
     with open("/localhome/stxue/bede/scheduler_data/job_dags.pkl", "rb") as f:
         test_graph_dict = pickle.load(f)
-    all_task_orderings = []
+    all_task_orderings = deque()
     bad_jobs = ('j_3805685')
     max_amt = 10000
     i = 0
@@ -1069,11 +1070,15 @@ def test_multiple_offline():
     online = OnlineScheduler(4023, 9600, 100, 0.1, 1, 1, 10)
     current_time = 0
     next_timestamps = []
-    for job_name, task_ordering in all_task_orderings:
+    while len(all_task_orderings) > 0:
+        job_name, task_ordering = all_task_orderings.pop()
         print(f'starting {job_name}')
-        scheduled, task_ordering, next_timestamp = online.schedule_tasks(job_name, task_ordering, current_time)
+        scheduled, leftover_task_ordering, next_timestamp = online.schedule_tasks(job_name, task_ordering, current_time)
         next_timestamps.append(next_timestamp)
         current_time = min(next_timestamps)
+        if len(leftover_task_ordering) > 0:
+            all_task_orderings.append((job_name, leftover_task_ordering))
+
 
 
 def main(args=None):
