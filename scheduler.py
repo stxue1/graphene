@@ -989,7 +989,7 @@ def consume_trace(options: argparse.Namespace):
     return
 
 def test_offline():
-    with open("scheduler_data/one_job_dag.pkl", "rb") as f:
+    with open("/localhome/stxue/bede/scheduler_data/one_job_dag.pkl", "rb") as f:
         test_graph = pickle.load(f)
     offline = OfflineGraphene()
     dag_allocation = {'cpu': 9600, 'mem': 100}
@@ -1007,7 +1007,7 @@ def test_offline():
 
 
 def get_some():
-    with open("scheduler_data/job_dags.pkl", "rb") as f:
+    with open("/localhome/stxue/bede/scheduler_data/job_dags.pkl", "rb") as f:
         test_graph_dict = pickle.load(f)
 
     to_delete = []
@@ -1034,7 +1034,7 @@ def get_one():
 
 
 def test_multiple_offline():
-    with open("scheduler_data/job_dags.pkl", "rb") as f:
+    with open("/localhome/stxue/bede/scheduler_data/job_dags.pkl", "rb") as f:
         test_graph_dict = pickle.load(f)
     all_task_orderings = []
     bad_jobs = ('j_3805685')
