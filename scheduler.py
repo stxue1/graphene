@@ -1,4 +1,7 @@
+from __future__ import annotations
+
 import argparse
+import functools
 import pickle
 from typing import Any
 
@@ -13,9 +16,13 @@ import copy
 import heapq
 import time
 import datetime as dt
+from itertools import islice
+
+from matplotlib import pyplot as plt
 from pytz import timezone
 from collections import deque
 import logging
+
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -126,6 +133,36 @@ def closure(graph: nx.DiGraph, considered_nodes: set) -> set:
     return closure
 
 
+def closure2(graph: nx.DiGraph, considered_nodes: set) -> set:
+    """
+    Same as the other closure operation, but use BFS to generate all reachable to and reachable from nodes, then take the intersection
+    """
+    if not considered_nodes:
+        return set()
+
+    queue = deque(considered_nodes)
+    reachable_from_considered = set()
+
+    while queue:
+        node = queue.popleft()
+        for neighbor in graph.neighbors(node):
+            if neighbor not in reachable_from_considered:
+                reachable_from_considered.add(neighbor)
+                queue.append(neighbor)
+
+    queue2 = deque(considered_nodes)
+    reachable_to_considered = set()
+
+    while queue2:
+        node = queue2.popleft()
+        for neighbor in graph.neighbors(node):
+            if neighbor not in reachable_to_considered:
+                reachable_to_considered.add(neighbor)
+                queue2.append(neighbor)
+
+    return reachable_to_considered.intersection(reachable_from_considered)
+
+
 def candidate_troublesome_tasks(graph: nx.DiGraph) -> set[tuple[frozenset, frozenset, frozenset, frozenset]]:
     """
     Identify the most troublesome tasks in the DAG, returns four subsets
@@ -141,7 +178,7 @@ def candidate_troublesome_tasks(graph: nx.DiGraph) -> set[tuple[frozenset, froze
 
     all_tasks = graph.nodes(data=True)
     all_task_names = []
-    max_duration = 0
+    max_duration = 0.1
     for name, details in all_tasks:
         all_task_names.append(name)
         max_current_duration = details['duration']
@@ -187,7 +224,7 @@ def candidate_troublesome_tasks(graph: nx.DiGraph) -> set[tuple[frozenset, froze
                 frag_score = stages[stage_name]['frag_score']
                 if long_score >= threshold_l or frag_score <= threshold_f:
                     t_nodes.add(name)
-            t_nodes = closure(graph, t_nodes)
+            t_nodes = closure2(graph, t_nodes)
 
             if t_nodes in seen:
                 continue
@@ -215,7 +252,9 @@ def candidate_troublesome_tasks(graph: nx.DiGraph) -> set[tuple[frozenset, froze
     return subsets_L
 
 
-# def tpriscores(tasks):
+@functools.lru_cache(maxsize=128)
+def calculate_srpt_j(running: frozenset[Machine.Task]):
+    return np.sum([task.dot() for task in running])
 
 
 class Machine:
@@ -256,8 +295,10 @@ class Machine:
         self.total_cpu = initial_cpu
         self.total_memory = initial_memory
         # running tasks, mapping job name to task information
-        self.running: dict[str, list[Machine.Task]] = dict()
+        self.running: dict[str, set[Machine.Task]] = dict()
         self.initial = initial_cpu, initial_memory
+
+        self.usage_log: dict = dict()
 
     @property
     def resources(self):
@@ -267,11 +308,28 @@ class Machine:
     def usage(self):
         return self.initial[0] - self.total_cpu, self.initial[1] - self.total_memory
 
-    def argmax_perfscore(self, task_perfscores: dict[str, tuple[Any, ...]]) -> str:
+    def log_usage(self, timestamp: int):
+        self.usage_log[timestamp] = self.usage
+
+    def calculate_perfscore(self, tpriscore: float, job_name: str, cpu: float, mem: float, eta: float):
+        pscore, oscore = 0, 0
+        if cpu <= self.total_cpu and mem <= self.total_memory:
+            # fits
+            pscore = np.dot(self.resources, (cpu, mem))
+        else:
+            # overbook
+            pass
+        srpt_j = calculate_srpt_j(frozenset(self.running.get(job_name, set())))
+
+        perfscore = tpriscore * max(pscore, oscore) - eta * srpt_j
+        return perfscore
+
+    def argmax_perfscore(self, job_name: str, task_info: dict[str, tuple[Any, ...]], eta: float) -> str:
         # argmax perfscore
         max_perfscore = None
         best_task = None
-        for task_name, (perfscore, cpu, mem, duration) in task_perfscores.items():
+        for task_name, (tpriscore, cpu, mem, duration) in task_info.items():
+            perfscore = self.calculate_perfscore(tpriscore, job_name, cpu, mem, eta)
             if perfscore > (max_perfscore or 0):
                 max_perfscore = perfscore
                 best_task = task_name
@@ -293,8 +351,8 @@ class Machine:
         end_tasks should have been run sometime before this, currently, this is done by the scheduler over all machines
         """
         self.use_resource(cpu, mem)
-        self.running.setdefault(job_name, [])
-        self.running[job_name].append(Machine.Task(task_name, duration, start_time, cpu, mem))
+        self.running.setdefault(job_name, set())
+        self.running[job_name].add(Machine.Task(task_name, duration, start_time, cpu, mem))
 
     def end_tasks(self, current_time) -> dict:
         """
@@ -310,7 +368,7 @@ class Machine:
                     self.free_resource(task.cpu, task.mem)
             if len(finished) > 0:
                 all_finished[job_name] = finished
-            self.running[job_name] = list(filter(lambda t: t.task_name not in finished, tasks))
+            self.running[job_name] = set(filter(lambda t: t.task_name not in finished, tasks))
         return all_finished
 
 
@@ -335,7 +393,7 @@ class OnlineScheduler:
         # finished tasks, mapping of job to set of tasks
         self.finished: dict[str, set] = dict()
 
-        self.machines = [Machine(cpu, mem)] * machines
+        self.machines = [Machine(cpu, mem) for _ in range(machines)]
 
         # todo: define this
         self.factor_t = 1
@@ -349,74 +407,136 @@ class OnlineScheduler:
 
         self.deficit_threshold = deficit_threshold
 
-    def check_predecessors(self, job_name, predecessors: list[str]):
-        return all(p in self.finished.get(job_name, {}) for p in predecessors)
+        # predecessor tracking to speedup
+        self.remaining_predecessors: dict[str, dict[str, set[str]]] = {}
+        # mapping of predecessor to task (child)
+        self.dependents: dict[str, dict[str, set[str]]] = {}
 
-    def set_finished(self, job_name: str, task_name: str):
-        self.finished.setdefault(job_name, set())
-        self.finished[job_name].add(task_name)
+    def plot_cluster_usage(self, filename: str):
+        timestamps = np.array(list(self.timestamp_to_usage.keys()))
+        cpu = np.array(list(value[0] for value in self.timestamp_to_usage.values()))
+        memory = np.array(list(value[1] for value in self.timestamp_to_usage.values()))
+
+        # norm
+        cpu /= self.total_cpu
+        memory /= self.total_mem
+
+        fig, ax1 = plt.subplots(figsize=(10, 4))  # plt.subplots(figsize=(9, 3))  # Set a figure size in inches
+
+        color = 'tab:red'
+        ax1.set_xlabel('Time (seconds)', fontsize=28)
+        ax1.set_ylabel('CPU (%)', color=color, fontsize=28)
+        ax1.plot(timestamps, cpu, color=color, linewidth=6)
+        ax1.tick_params(axis='y', labelcolor=color, labelsize=20)
+        ax1.tick_params(axis='x', labelsize=20)
+
+        ax2 = ax1.twinx()  # instantiate a second axes that shares the same x-axis
+        color = 'tab:blue'
+        ax2.set_ylabel('Memory (%)', color=color, fontsize=28)  # we already handled the x-label with ax1
+        ax2.plot(timestamps, memory, color=color, linewidth=6)
+        ax2.tick_params(axis='y', labelcolor=color, labelsize=20)
+
+        fig.tight_layout()  # otherwise the right y-label is slightly clipped
+        # plt.title('Utilization Graph')
+        plt.savefig(f'scheduler_data/{filename}', bbox_inches='tight', pad_inches=0.07)
+        plt.show()
+
+    def add_predecessors_for_job(self, job_name: str, task_name: str, predecessors: tuple[str]):
+        self.remaining_predecessors.setdefault(job_name, dict())
+        self.remaining_predecessors[job_name][task_name] = set(predecessors)
+        self.dependents.setdefault(job_name, dict())
+        for p in predecessors:
+            self.dependents[job_name].setdefault(p, set())
+            self.dependents[job_name][p].add(task_name)
+
+    def remove_predecessors(self, job_name: str, predecessor_task: str):
+        # there may not be any children or dependent jobs to this one
+        for dependent_task in self.dependents[job_name].get(predecessor_task, []):
+            self.remaining_predecessors[job_name][dependent_task].discard(predecessor_task)
+
+    def remove_job_precedessor_tracker(self, job_name: str):
+        del self.remaining_predecessors[job_name]
+        del self.dependents[job_name]
+
+    def check_predecessors(self, job_name, task_to_check):
+        return len(self.remaining_predecessors[job_name][task_to_check]) == 0
+
+    def check_predecessors_old(self, job_name, predecessors: tuple[str]):
+        return all(p in self.finished.get(job_name, {}) for p in predecessors)
 
     def set_finished_bunch(self, job_name, tasks: set[str]):
         self.finished.setdefault(job_name, set())
         self.finished[job_name].update(tasks)
+        for t in tasks:
+            # todo: if we schedule everything before the tasks finish, these will already be gone
+            # I should move ownership of this handling into the scheduler itself (the deletion of predecessor trackers)
+            if self.dependents.get(job_name):
+                self.remove_predecessors(job_name, t)
 
-    def find_appropriate_tasks_for_machine(self, machine: Machine, job_name: str, tasks: list[tuple[str, tuple[Any, ...]]], current_time: int):
+    def delete_finished(self, job_name: str):
+        # I think if all tasks in a job are scheduled at once, it will never exist in the finished dictionary
+        if self.finished.get(job_name):
+            del self.finished[job_name]
+
+    def find_appropriate_tasks_for_machine(self, machine: Machine, job_name: str, tasks: list[tuple[str, tuple[Any, ...]]], current_time: int) -> tuple[dict, list]:
         """
         Try and schedule all tasks onto current machine at a given timestamp
 
         Returns set of scheduled task names and the next timestamps to consider, which is the timestamps when a task completes
+
+        :param tasks: new tasks to add
+        :return: dictionary of job name to scheduled tasks and list of next times to consider
         """
-        scheduled = set()
+        # todo: these ownership constructs results in a not a very pythonic (or intuitive) approach
+        scheduled = dict()
         next_timestamp = []
         while True:
             for task_name, (duration, cpu, mem, tpriscore, predecessors) in tasks:
                 # already scheduled tasks are no longer considered
-                if task_name in scheduled:
+                if task_name in scheduled.get(job_name, set()):
                     continue
-                pscore, oscore = 0, 0
-                if cpu <= machine.total_cpu and mem <= machine.total_memory:
-                    # fits
-                    pscore = np.dot(machine.resources, (cpu, mem))
-                else:
-                    # overbook
-                    pass
-                srpt_j = np.sum([task.dot() for task in machine.running.get(job_name, [])])
-
-                perfscore = tpriscore * max(pscore, oscore) - self.eta * srpt_j
                 # store demands alongside
                 # todo: graphene doesnt say how they do duration here
                 self.job_tasks.setdefault(job_name, dict())
-                self.job_tasks[job_name][task_name] = (perfscore, cpu, mem, duration)
+                self.job_tasks[job_name][task_name] = (tpriscore, cpu, mem, duration)
                 self.job_deficit.setdefault(job_name, 0)
 
+            if len(self.job_tasks.get(job_name, [])) == 0:
+                # no more tasks
+                break
             # consider this job first
-            best_task = machine.argmax_perfscore(self.job_tasks[job_name])
+            best_task = machine.argmax_perfscore(job_name, self.job_tasks[job_name], self.eta)
+
+            # if unfairness is too high, choose another job
+            current_job = job_name
+            # if len(self.job_deficit) > 0:
+            #     job_most_deficit = max(self.job_deficit, key=self.job_deficit.get)
+            #     highest_deficit = self.job_deficit[job_most_deficit]
+            # else:
+            #     job_most_deficit = None
+            #     highest_deficit = None
+            #
+            # if highest_deficit is not None and highest_deficit >= self.deficit_threshold:
+            #     discriminated_task_perfscores = self.job_tasks[job_most_deficit]
+            #     best_task = machine.argmax_perfscore(job_most_deficit, discriminated_task_perfscores, self.eta)
+            #     current_job = job_most_deficit
 
             if best_task is None:
                 break
 
-            # if unfairness is too high, choose another job
-            current_job = job_name
-            if len(self.job_deficit) > 0:
-                job_most_deficit = max(self.job_deficit, key=self.job_deficit.get)
-                highest_deficit = self.job_deficit[job_most_deficit]
-            else:
-                job_most_deficit = None
-                highest_deficit = None
+            # if we scheduled a job, reset its deficit to 0
+            self.job_deficit[current_job] = 0
 
-            if highest_deficit is not None and highest_deficit >= self.deficit_threshold:
-                discriminated_task_perfscores = self.job_tasks[job_most_deficit]
-                best_task = machine.argmax_perfscore(discriminated_task_perfscores)
-                current_job = job_most_deficit
             best_task_data = self.job_tasks[current_job][best_task]
 
             task_cpu = best_task_data[1]
             task_mem = best_task_data[2]
             task_duration = best_task_data[3]
-            scheduled.add(best_task)
             # in hindsight, maybe I could've used Space, but this in theory should be faster
-            next_timestamp.append(task_duration + current_time)
             if machine.resources_are_available(task_cpu, task_mem):
+                next_timestamp.append(task_duration + current_time)
+                scheduled.setdefault(current_job, set())
+                scheduled[current_job].add(best_task)
                 machine.run_task(current_job, best_task, task_cpu, task_mem, task_duration, current_time)
                 # update deficit counters, use slot fairness (or something similar to it)
                 for j in self.job_deficit.keys():
@@ -424,12 +544,34 @@ class OnlineScheduler:
                         self.job_deficit[j] += 1
                 # remove since we scheduled
                 del self.job_tasks[current_job][best_task]
+                tasks = list(filter(lambda t: t[0] != best_task, tasks))
                 # get rid of empty job deficits
                 if len(self.job_tasks[current_job]) == 0:
                     del self.job_deficit[current_job]
-            # if we can't schedule, this should mean no machines are available for this task, so continue
-
+                    del self.job_tasks[current_job]
+            # if we can't schedule, this should mean no machines are available for this task, try again later (no overbooking implemented)
+            else:
+                break
         return scheduled, next_timestamp
+
+    def finish_rest(self):
+        # ideally this should be part of the schedule loop
+        if len(self.next_timestamps) == 0:
+            return
+
+        current_time = min(self.next_timestamps)
+
+        for machine in self.machines:
+            finished = machine.end_tasks(current_time)
+            for finished_job_name, finished_tasks in finished.items():
+                self.set_finished_bunch(finished_job_name, finished_tasks)
+        self.timestamp_to_usage[current_time] = (0, 0)
+        for machine in self.machines:
+            machine_cpu_usage, machine_mem_usage = machine.usage
+            self.timestamp_to_usage[current_time] = (self.timestamp_to_usage[current_time][0] + machine_cpu_usage, self.timestamp_to_usage[current_time][1] + machine_mem_usage)
+            machine.log_usage(current_time)
+
+        self.next_timestamps = list(filter(lambda x: x > current_time, self.next_timestamps))
 
     def schedule_tasks(self, job_name: str, tasks: list[tuple[str, tuple[Any, ...]]], current_time: int):
         """
@@ -437,29 +579,110 @@ class OnlineScheduler:
 
         Returns set of task names that were scheduled, leftover tasks that could not be scheduled, and the next timestamp to consider (first timestmap when the next task ends)
         """
-        total_scheduled = set()
+
+        total_scheduled = dict()
         for machine in self.machines:
             finished = machine.end_tasks(current_time)
-            for job_name, finished_tasks in finished.items():
-                self.set_finished_bunch(job_name, finished_tasks)
-        self.timestamp_to_usage[current_time] = dict()
+            for finished_job_name, finished_tasks in finished.items():
+                self.set_finished_bunch(finished_job_name, finished_tasks)
+        self.timestamp_to_usage[current_time] = (0, 0)
         for machine in self.machines:
-            scheduleable = list(filter(lambda t: self.check_predecessors(job_name, t[1][4]), tasks))
+            # scheduleable = list(filter(lambda t: self.check_predecessors_old(job_name, t[1][4]) and t[0] not in self.finished.get(job_name, {}), tasks))
+            scheduleable = list(filter(lambda t: self.check_predecessors(job_name, t[0]) and t[0] not in self.finished.get(job_name, {}), tasks))
+
             scheduled, timestamps = self.find_appropriate_tasks_for_machine(machine, job_name, scheduleable, current_time)
+
             self.next_timestamps.extend(timestamps)
-            total_scheduled.update(scheduled)
-            tasks = list(filter(lambda t: t[0] not in scheduled, tasks))
+            for j, scheduled_tasks in scheduled.items():
+                total_scheduled.setdefault(j, set())
+                total_scheduled[j].update(scheduled_tasks)
+            tasks = list(filter(lambda t: t[0] not in scheduled.get(job_name, set()), tasks))
             machine_cpu_usage, machine_mem_usage = machine.usage
-            self.timestamp_to_usage[current_time]['cpu'] = machine_cpu_usage
-            self.timestamp_to_usage[current_time]['mem'] = machine_mem_usage
+            self.timestamp_to_usage[current_time] = (self.timestamp_to_usage[current_time][0] + machine_cpu_usage, self.timestamp_to_usage[current_time][1] + machine_mem_usage)
+            machine.log_usage(current_time)
         # return new set of tasks that could not be ran yet, in order to schedule later
         if len(self.next_timestamps) > 0:
             next_timestamp = min(self.next_timestamps)
             self.next_timestamps = list(filter(lambda x: x > next_timestamp, self.next_timestamps))
         else:
             next_timestamp = current_time + 1
-            # print('none')
         return total_scheduled, tasks, next_timestamp
+
+
+    def find_appropriate_tasks_for_machine_fifo(self, machine: Machine, job_name: str, tasks: list[tuple[str, tuple[Any, ...]]], current_time: int) -> tuple[dict, list]:
+        # this is a pretty messy but itll do the trick
+        scheduled = set()
+        next_timestamp = []
+        while True:
+            best_task = None
+            task_cpu, task_mem, task_duration = None, None, None
+            for task_name, (duration, cpu, mem, tpriscore, predecessors) in tasks:
+                # already scheduled tasks are no longer considered
+                if task_name in scheduled:
+                    continue
+                if machine.resources_are_available(cpu, mem):
+                    best_task = task_name
+                    task_cpu = cpu
+                    task_mem = mem
+                    task_duration = duration
+            if len(tasks) == 0:
+                # no more tasks
+                break
+            current_job = job_name
+
+            if best_task is None:
+                # cannot schedule, no resources
+                break
+
+            assert task_cpu is not None
+            assert task_mem is not None
+            assert task_duration is not None
+
+            next_timestamp.append(task_duration + current_time)
+            scheduled.add(best_task)
+            machine.run_task(current_job, best_task, task_cpu, task_mem, task_duration, current_time)
+            # remove since we scheduled
+            tasks = list(filter(lambda t: t[0] != best_task, tasks))
+        return {job_name: scheduled}, next_timestamp
+    def schedule_tasks_fifo(self, job_name: str, tasks: list[tuple[str, tuple[Any, ...]]], current_time: int):
+        # messy, but itll do the trick
+        total_scheduled = dict()
+        for machine in self.machines:
+            finished = machine.end_tasks(current_time)
+            for finished_job_name, finished_tasks in finished.items():
+                self.set_finished_bunch(finished_job_name, finished_tasks)
+        self.timestamp_to_usage[current_time] = (0, 0)
+        for machine in self.machines:
+            # scheduleable = list(filter(lambda t: self.check_predecessors_old(job_name, t[1][4]) and t[0] not in self.finished.get(job_name, {}), tasks))
+            scheduleable = list(filter(lambda t: self.check_predecessors(job_name, t[0]) and t[0] not in self.finished.get(job_name, {}), tasks))
+
+            scheduled, timestamps = self.find_appropriate_tasks_for_machine_fifo(machine, job_name, scheduleable, current_time)
+
+            self.next_timestamps.extend(timestamps)
+            for j, scheduled_tasks in scheduled.items():
+                total_scheduled.setdefault(j, set())
+                total_scheduled[j].update(scheduled_tasks)
+            tasks = list(filter(lambda t: t[0] not in scheduled.get(job_name, set()), tasks))
+            machine_cpu_usage, machine_mem_usage = machine.usage
+            self.timestamp_to_usage[current_time] = (self.timestamp_to_usage[current_time][0] + machine_cpu_usage, self.timestamp_to_usage[current_time][1] + machine_mem_usage)
+            machine.log_usage(current_time)
+        # return new set of tasks that could not be ran yet, in order to schedule later
+        if len(self.next_timestamps) > 0:
+            next_timestamp = min(self.next_timestamps)
+            self.next_timestamps = list(filter(lambda x: x > next_timestamp, self.next_timestamps))
+        else:
+            next_timestamp = current_time + 1
+        return total_scheduled, tasks, next_timestamp
+
+    @property
+    def cluster_usage(self):
+        cpu = 0
+        mem = 0
+        for machine in self.machines:
+            machine_cpu, machine_mem = machine.resources
+            cpu += machine_cpu
+            mem += machine_mem
+        return cpu, mem
 
 
 class Space:
@@ -516,7 +739,10 @@ class Space:
             self.placed[name] = (schedule_time, end_time, cpu_needed, memory_needed, duration)
 
             return True
-        return False
+        else:
+            # Recurisvely try again with a new timestamp
+            # this can happen if at the next timestamp, the other resource is not available
+            return self.insert_task(name, cpu_needed, memory_needed, duration, start_time=schedule_time)
 
     def end_time(self, task_name: str) -> int:
         """
@@ -535,6 +761,9 @@ class Space:
         """
         Invert the space by inverting all timestamps. Use only when converting backwards placements into forward placements.
         """
+        if len(self.placed) == 0:
+            # nothing to invert
+            return
         completion_time = self.completion_time()
         for name, timestamps in self.placed.items():
             self.placed[name] = (completion_time - timestamps[0], completion_time - timestamps[1]) + tuple(timestamps[2:])
@@ -558,7 +787,7 @@ class Space:
             cpu = task_info[2]
             mem = task_info[3]
             # this might be a little slow due to networkx
-            predecessors = list(graph.predecessors(task_name))
+            predecessors = tuple(graph.predecessors(task_name))
             # + 1 to avoid negative calculations later
             processed.append((task_name, (duration, cpu, mem, i + 1 / num_tasks, predecessors)))
         return processed
@@ -669,7 +898,6 @@ class OfflineGraphene:
             space = Space(dag_allocation['cpu'], dag_allocation['mem'])
             subset_T, subset_S, subset_P, subset_C = set(subsets[0]), set(subsets[1]), set(subsets[2]), set(subsets[3])
             # if subset_T == {'1/0', '11/0', '11/1', '11/2', '12/0', '12/2', '12/3', '2/0'}:
-            #     print()
 
             # as a modification from the graphene algorithm, since the placing pseudocode only permits placing tasks that have satisfied dependencies, but does not
             # consider how to place troublesome tasks with dependencies first, I have two choices:
@@ -682,14 +910,15 @@ class OfflineGraphene:
             # children/parents/siblings of all tasks in the troublesome set
             # Since the algorithm doesn't specify, I believe the best way to deal with this is to disregard dependencies
             # I will need to update my placing algorithms to handle placing parents before the troublesome tasks, which I will do later
-            space = self.place_tasks(subset_T, space, graph)
-            if len(space.placed_tasks()) != len(subset_T):
-                continue
+            space = self.place_tasks(subset_T, space, graph, disregard_dependencies=True)
+            # if len(space.placed_tasks()) != len(subset_T):
+            #     continue
 
             # if placing only what I can, include a line like this:
             # subset_S.update(subset_T.difference(set(space.placed_tasks())))
 
             space = self.try_subset_orders(space, subset_S, subset_P, subset_C, graph)
+
             space_completion_time = space.completion_time()
             if best is None or space_completion_time < best_completion_time:
                 best = space
@@ -698,6 +927,8 @@ class OfflineGraphene:
         return best.task_details(graph)
 
     def place_tasks(self, subset: set, space: Space, graph: nx.DiGraph, disregard_dependencies: bool = False) -> Space:
+        if len(subset) == 0:
+            return space
         forward_space = self.place_tasks_forward(subset, space, graph, disregard_dependencies)
         backward_space = self.place_tasks_backward(subset, space, graph, disregard_dependencies)
         if forward_space.completion_time() <= backward_space.completion_time():
@@ -706,15 +937,15 @@ class OfflineGraphene:
             return backward_space
 
     def try_subset_orders(self, space: Space, subset_S: set, subset_P: set, subset_C: set, graph: nx.DiGraph):
-        subset_orders = [self.place_tasks_forward(subset_C, self.place_tasks_backward(subset_P, self.place_tasks(subset_S, space, graph), graph), graph),  # spc
-                         self.place_tasks_backward(subset_P, self.place_tasks_forward(subset_C, self.place_tasks(subset_S, space, graph), graph), graph),  # scp
-                         self.place_tasks_backward(subset_P, self.place_tasks_backward(subset_S, self.place_tasks_forward(subset_C, space, graph), graph), graph),  # csp
-                         self.place_tasks_forward(subset_C, self.place_tasks_forward(subset_S, self.place_tasks_backward(subset_P, space, graph), graph), graph)]  # psc
+        subset_orders = [self.place_tasks_forward(subset_C, self.place_tasks_backward(subset_P, self.place_tasks(subset_S, space, graph, disregard_dependencies=True), graph), graph),  # spc
+                         self.place_tasks_backward(subset_P, self.place_tasks_forward(subset_C, self.place_tasks(subset_S, space, graph, disregard_dependencies=True), graph), graph),  # scp
+                         self.place_tasks_backward(subset_P, self.place_tasks_backward(subset_S, self.place_tasks_forward(subset_C, space, graph), graph, disregard_dependencies=True), graph),  # csp
+                         self.place_tasks_forward(subset_C, self.place_tasks_forward(subset_S, self.place_tasks_backward(subset_P, space, graph), graph, disregard_dependencies=True), graph)]  # psc
         return subset_orders[np.argmin([subset.completion_time() for subset in subset_orders])]
 
     @staticmethod
     def place_tasks_forward(subset: set, space: Space, graph: nx.DiGraph, disregard_dependencies: bool = False) -> Space:
-        space_clone = copy.copy(space)
+        space_clone = copy.deepcopy(space)
         finished = set(space_clone.placed_tasks())
         tasks = list(graph.nodes(data=True))
         tasks = list(filter(lambda x: x[0] in subset, tasks))
@@ -741,7 +972,7 @@ class OfflineGraphene:
             if len(ready) == 0:
                 break
 
-            task_dependencies = set(graph.predecessors(longest_task_in_ready))
+            task_dependencies = set(graph.predecessors(longest_task_in_ready)) if disregard_dependencies is False else set()
             if len(task_dependencies) == 0:
                 scheduleable_timestamp = 0
             else:
@@ -757,10 +988,11 @@ class OfflineGraphene:
     @staticmethod
     def place_tasks_backward(subset: set, space: Space, graph: nx.DiGraph, disregard_dependencies: bool = False):
         """
-        This is the exact same as place_tasks_forward but under the assumption that reversing the timeline after placing backwards on an initially increasing timeline is equivalent
-        to placing backwards properly
+        This is the exact same as place_tasks_forward but under the assumption that reversing the timeline before and after placing backwards on an initially increasing timeline is
+        equivalent to placing backwards properly
         """
         space_clone = copy.copy(space)
+        space_clone.invert()
         finished = set(space_clone.placed_tasks())
         tasks = list(graph.nodes(data=True))
         tasks = list(filter(lambda x: x[0] in subset, tasks))
@@ -788,7 +1020,7 @@ class OfflineGraphene:
             if len(ready) == 0:
                 break
 
-            task_dependencies = set(graph.successors(longest_task_in_ready))
+            task_dependencies = set(graph.successors(longest_task_in_ready)) if disregard_dependencies is False else set()
             if len(task_dependencies) == 0:
                 scheduleable_timestamp = 0
             else:
@@ -883,7 +1115,6 @@ def consume_trace(options: argparse.Namespace):
     max_iter = num_lines // chunksize + 1
     total = invalid = 0
 
-    early_stop_iter = 20
     max_timestamp = 86400 * 3
 
     job_dags = {}
@@ -906,6 +1137,24 @@ def consume_trace(options: argparse.Namespace):
         if good_dag:
             good_job_dags[job_name] = graph
 
+    LIMIT = 100
+    LIMIT_DUMP_ITERATION = 100
+    def dump_good_dags(good_job_dags, dump_iteration):
+        # idk why I can't rely on variable scope here
+        if len(good_job_dags) > LIMIT:
+            dump_filename = os.path.join("scheduler_data", f"job_dags_{dump_iteration}.pkl")
+            with open(dump_filename, "wb") as f:
+                sliced = dict(islice(good_job_dags.items(), LIMIT))
+                pickle.dump(sliced, f)
+            for k in sliced.keys():
+                del good_job_dags[k]
+            logger.info(f"Dumped iteration {dump_iteration}")
+            dump_iteration += 1
+        if dump_iteration > LIMIT_DUMP_ITERATION:
+            return good_job_dags, -1
+        return good_job_dags, dump_iteration
+    dump_iteration = 0
+
     def filter_old_dags():
         to_delete = []
         for job_name, dag in job_dags.items():
@@ -917,9 +1166,13 @@ def consume_trace(options: argparse.Namespace):
                 del latest_seen_job_timestamp[job_name]
         for job_name in to_delete:
             del job_dags[job_name]
-
+    
+    start = time.time()
+    # limit runtime to 3 hours
+    LIMIT_RUNTIME = 60 * 60 * 3
     for j, data in enumerate(pd.read_csv(trace_file, chunksize=chunksize, names=get_batch_instance_column_names())):
-        if j > early_stop_iter:
+        current_time = time.time()
+        if current_time - start > LIMIT_RUNTIME:
             break
         data.dropna(inplace=True)
 
@@ -954,7 +1207,9 @@ def consume_trace(options: argparse.Namespace):
                        # cpu_avg=cpu_avg / cpu_norm, cpu_max=cpu_max / cpu_norm, mem_avg=mem_avg / mem_norm, mem_max=mem_max / mem_norm, plan_cpu=plan_cpu / cpu_norm,
                        # plan_mem=plan_mem / mem_norm,
                        cpu=cpu_avg, mem=mem_avg,
-                       job_name=job_name, task_name=task_name, instance_name=instance_name, duration=completion_time)
+                       job_name=job_name, task_name=task_name,
+                       # instance_name=instance_name,
+                       duration=completion_time)
             # When adding edges, I am assuming that the production trace does not run a single child instance until all parent instances are done
             dependencies = task_to_dependencies(task_name)
             for parent in dependencies:
@@ -968,38 +1223,19 @@ def consume_trace(options: argparse.Namespace):
                     # I'm putting the child task completion time, which means each edge is how long until the end of the child
                     G.add_edge(parent_task_name, current_task_name, weight=completion_time)
         filter_old_dags()
+        good_job_dags, dump_iteration = dump_good_dags(good_job_dags, dump_iteration)
+        if dump_iteration == -1:
+            # we surpassed the limit set for amount of dumpfiles to create, so quit out before we pollute the server with terabytes of files
+            break
 
-    for job_name, dag in job_dags.items():
-        consider_good_dag(job_name, dag)
-        # no point deleting here as we're never going to use it again
-    del job_dags
-    if options.skip_amt is not None:
-        delete_count = 0
-        to_delete = []
-        for k in good_job_dags.keys():
-            if delete_count > options.skip:
-                break
-            if 100 <= len(list(good_job_dags[k].nodes())) <= 500:
-                continue
-            to_delete.append(k)
-            delete_count += 1
-        for k in to_delete:
-            del good_job_dags[k]
-    with open("scheduler_data/job_dags.pkl", "wb") as f:
-        pickle.dump(good_job_dags, f)
-    return
 
 def test_offline():
-    with open("/localhome/stxue/bede/scheduler_data/one_job_dag.pkl", "rb") as f:
+    with open("scheduler_data/one_job_dag.pkl", "rb") as f:
         test_graph = pickle.load(f)
     offline = OfflineGraphene()
     dag_allocation = {'cpu': 9600, 'mem': 100}
     job_name = list(test_graph.nodes(data=True))[0][1]['job_name']
-    print(f'loading job {job_name}')
-    print(len(list(test_graph.nodes())))
     task_ordering = offline.build_schedule(test_graph, m=1, dag_allocation=dag_allocation)
-    print([t[0] for t in task_ordering])
-    print(len([t[0] for t in task_ordering]))
     online = OnlineScheduler(4023, 9600, 100, 0.1, 1, 1, 10)
     current_time = 0
     while len(task_ordering) != 0:
@@ -1008,7 +1244,7 @@ def test_offline():
 
 
 def get_some():
-    with open("/localhome/stxue/bede/scheduler_data/job_dags.pkl", "rb") as f:
+    with open("scheduler_data/job_dags.pkl", "rb") as f:
         test_graph_dict = pickle.load(f)
 
     to_delete = []
@@ -1031,18 +1267,33 @@ def get_one():
         test_graph_dict = pickle.load(f)
 
     with open("scheduler_data/one_job_dag.pkl", "wb") as f:
-        pickle.dump(test_graph_dict['j_2583911'], f)
+        another_dict = {}
+        # another_dict['j_2583911'] = test_graph_dict['j_2583911']
+        # another_dict['j_1288147'] = test_graph_dict['j_1288147']
 
+        # another_dict['j_2227610'] = test_graph_dict['j_2227610']
+        # another_dict['j_1719626'] = test_graph_dict['j_1719626']
 
-def test_multiple_offline():
-    with open("/localhome/stxue/bede/scheduler_data/job_dags.pkl", "rb") as f:
+        # another_dict['j_3795195'] = test_graph_dict['j_3795195']
+
+        # another_dict['j_3727204'] = test_graph_dict['j_3727204']
+
+        another_dict['j_2635372'] = test_graph_dict['j_2635372']
+
+        pickle.dump(another_dict, f)
+
+def run_offline_graphene(path: str, output_path: str):
+    with open(path, "rb") as f:
         test_graph_dict = pickle.load(f)
-    all_task_orderings = deque()
-    bad_jobs = ('j_3805685')
+
+    # with open("scheduler_data/one_job_dag.pkl", "rb") as f:
+    #     test_graph_dict = pickle.load(f)
+    all_task_orderings = dict()
+    bad_jobs = ('j_3805685', 'j_3983852', 'j_2635372')
+    # j_2635372 is missing one?? node M2/1 is missing data??
     max_amt = 10000
     i = 0
-    max_jobs = 1
-    print(f"len of test graph is {len(test_graph_dict)}")
+    max_jobs = 1000
     for job_name, graph in test_graph_dict.items():
         i += 1
         if i > max_amt:
@@ -1055,30 +1306,174 @@ def test_multiple_offline():
         offline = OfflineGraphene()
         dag_allocation = {'cpu': 9600, 'mem': 100}
         job_name = list(graph.nodes(data=True))[0][1]['job_name']
-        print(len(list(graph.nodes())))
 
-        if len(list(graph.nodes())) <= 50:
+        # if len(list(graph.nodes())) <= 1000:
+        #     continue
+        # if len(list(graph.nodes())) >= 2000:
+        #     continue
+        print(f"found job with {len(list(graph.nodes()))} nodes {job_name}")
+        try:
+            task_ordering = offline.build_schedule(graph, m=1, dag_allocation=dag_allocation)
+        except Exception as e:
+            # some jobs seem to be malformed for one reason or another (particularly empty node data in my graph), just ignore them for now
+            print(f'{job_name} has exception? {e}')
             continue
-        if len(list(graph.nodes())) >= 100:
-            continue
-        print(job_name, len(list(graph.nodes())))
-        task_ordering = offline.build_schedule(graph, m=1, dag_allocation=dag_allocation)
-        print([t[0] for t in task_ordering])
-        print(len([t[0] for t in task_ordering]))
-        all_task_orderings.append((job_name, task_ordering))
-        print("next")
-    online = OnlineScheduler(4023, 9600, 100, 0.1, 1, 1, 10)
+        # print(len([t[0] for t in task_ordering]))
+
+        all_task_orderings[job_name] = task_ordering
+
+    task_dependencies = {}
+    for job_name, task_infos in all_task_orderings.items():
+        task_dependencies.setdefault(job_name, dict())
+        for task_info in task_infos:
+            task_dependencies[job_name].setdefault(task_info[0], dict())
+            task_dependencies[job_name][task_info[0]] = task_info[1][4]
+
+    # consider all jobs at a time in one epoch
+    print('offline done')
+    rng = np.random.default_rng(seed=10)
+    random_indices_sequence = rng.choice(
+        np.arange(0, len(all_task_orderings)),
+        size=len(all_task_orderings),
+        replace=False
+    )
+
+    to_schedule = deque()
+    starting_time = 0
+    for i in random_indices_sequence:
+        job_name = list(all_task_orderings.keys())[i]
+        e = all_task_orderings[job_name]
+        to_schedule.append((starting_time, job_name, e))
+        starting_time += 15
+
+    with open(output_path, "wb") as f:
+        pickle.dump((to_schedule, task_dependencies), f)
+
+def test_multiple_online():
+    online = OnlineScheduler(10, 9600, 100, 0.1, 1, 1, 10)
+
     current_time = 0
+    all_scheduled = dict()
+    scheduleable_jobs = dict()
     next_timestamps = []
-    while len(all_task_orderings) > 0:
-        job_name, task_ordering = all_task_orderings.pop()
-        print(f'starting {job_name}')
-        scheduled, leftover_task_ordering, next_timestamp = online.schedule_tasks(job_name, task_ordering, current_time)
-        next_timestamps.append(next_timestamp)
-        current_time = min(next_timestamps)
-        if len(leftover_task_ordering) > 0:
-            all_task_orderings.append((job_name, leftover_task_ordering))
 
+    for i in range(100):
+        if i > 1:
+            break
+        path = f"scheduler_data/offline/offline_job_dags_{i}.pkl"
+        if not os.path.exists(path):
+            logger.info(f"path {path} does not exist")
+            break
+        logger.info(f"reading path {path}")
+        with open(path, "rb") as f:
+            to_schedule, task_dependencies = pickle.load(f)
+
+        for job_name, task_dep_info in task_dependencies.items():
+            for task_name, task_dep in task_dep_info.items():
+                online.add_predecessors_for_job(job_name, task_name, task_dep)
+        while True:
+            if len(to_schedule) == 0:
+                break
+            if current_time >= to_schedule[0][0]:
+                _, to_schedule_job_name, to_schedule_task_ordering = to_schedule.popleft()
+                scheduleable_jobs[to_schedule_job_name] = to_schedule_task_ordering
+            if len(to_schedule) > 0:
+                next_timestamps.append(to_schedule[0][0])
+            scheduled_jobs = []
+            new_task_orderings = dict()
+            for i, (job_name, task_ordering) in enumerate(scheduleable_jobs.items()):
+                try:
+                    scheduled, leftover_task_ordering, next_timestamp = online.schedule_tasks(job_name, task_ordering, current_time)
+                except:
+                    print(job_name)
+                    raise
+
+                for j, scheduled_tasks in scheduled.items():
+                    all_scheduled.setdefault(j, set())
+                    all_scheduled[j].update(scheduled_tasks)
+                next_timestamps.append(next_timestamp)
+
+                if len(leftover_task_ordering) == 0:
+                    scheduled_jobs.append(job_name)
+                else:
+                    new_task_orderings[job_name] = leftover_task_ordering
+                # remove scheduled tasks
+            # temp
+            # next_timestamps.append(current_time + 1)
+            current_time = min(next_timestamps)
+            next_timestamps = list(filter(lambda x: x > current_time, next_timestamps))
+            for job_name, leftover_task_ordering in new_task_orderings.items():
+                scheduleable_jobs[job_name] = leftover_task_ordering
+            for job_name in scheduled_jobs:
+                del scheduleable_jobs[job_name]
+                online.delete_finished(job_name)
+                online.remove_job_precedessor_tracker(job_name)
+    online.finish_rest()
+
+    online.plot_cluster_usage('graphene_utilization.png')
+
+def test_multiple_online_fifo():
+    # messy, but itll do the trick
+    online = OnlineScheduler(10, 9600, 100, 0.1, 1, 1, 10)
+
+    current_time = 0
+    all_scheduled = dict()
+    scheduleable_jobs = dict()
+    schedule_time = 0
+    next_timestamps = []
+
+    rng = np.random.default_rng(10)
+
+    for i in range(100):
+        path = f"scheduler_data/offline/offline_job_dags_{i}.pkl"
+        if not os.path.exists(path):
+            break
+
+        with open(path, "rb") as f:
+            to_schedule, task_dependencies = pickle.load(f)
+
+        for job_name, task_dep_info in task_dependencies.items():
+            for task_name, task_dep in task_dep_info.items():
+                online.add_predecessors_for_job(job_name, task_name, task_dep)
+
+        while True:
+            if len(to_schedule) == 0:
+                break
+            if to_schedule[0][0] >= current_time:
+                _, to_schedule_job_name, to_schedule_task_ordering = to_schedule.popleft()
+                to_schedule_task_ordering = rng.permutation(np.array(to_schedule_task_ordering, dtype=object))
+                scheduleable_jobs[to_schedule_job_name] = to_schedule_task_ordering
+            if len(to_schedule) > 0:
+                next_timestamps.append(to_schedule[0][0])
+            scheduled_jobs = []
+            new_task_orderings = dict()
+            for i, (job_name, task_ordering) in enumerate(scheduleable_jobs.items()):
+                try:
+                    scheduled, leftover_task_ordering, next_timestamp = online.schedule_tasks_fifo(job_name, task_ordering, current_time)
+                except:
+                    print(job_name)
+                    raise
+
+                for j, scheduled_tasks in scheduled.items():
+                    all_scheduled.setdefault(j, set())
+                    all_scheduled[j].update(scheduled_tasks)
+                next_timestamps.append(next_timestamp)
+                if len(leftover_task_ordering) == 0:
+                    scheduled_jobs.append(job_name)
+                else:
+                    new_task_orderings[job_name] = leftover_task_ordering
+            current_time = min(next_timestamps)
+            next_timestamps = list(filter(lambda x: x > current_time, next_timestamps))
+                # remove scheduled tasks
+            for job_name, leftover_task_ordering in new_task_orderings.items():
+                scheduleable_jobs[job_name] = leftover_task_ordering
+            for job_name in scheduled_jobs:
+                del scheduleable_jobs[job_name]
+                online.delete_finished(job_name)
+                online.remove_job_precedessor_tracker(job_name)
+    online.finish_rest()
+
+    online.plot_cluster_usage('fifo_utilization.png')
 
 
 def main(args=None):
@@ -1094,6 +1489,8 @@ def main(args=None):
     if not os.path.exists(output_file) and options.skip is False:
         get_last_job_timestamp_in_trace()
 
+    os.makedirs("scheduler_data/offline", exist_ok=True)
+
     # consume_trace()
     if options.operation == "get_one":
         get_one()
@@ -1101,8 +1498,17 @@ def main(args=None):
         get_some()
     elif options.operation == "consume":
         consume_trace(options)
-    elif options.operation == "multiple":
-        test_multiple_offline()
+    elif options.operation == "offline_graphene":
+        for i in range(100):
+            path=f"scheduler_data/job_dags_{i}.pkl"
+            output_path = f"scheduler_data/offline/offline_job_dags_{i}.pkl"
+            if not os.path.exists(path):
+                break
+            run_offline_graphene(path, output_path)
+    elif options.operation == "multiple_online":
+        test_multiple_online()
+    elif options.operation == "multiple_online_fifo":
+        test_multiple_online_fifo()
     else:
         test_offline()
 
