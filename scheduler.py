@@ -336,7 +336,7 @@ class Machine:
         best_task = None
         for task_name, (tpriscore, cpu, mem, duration) in task_info.items():
             perfscore = self.calculate_perfscore(tpriscore, job_name, cpu, mem, eta)
-            if perfscore > (max_perfscore or 0):
+            if perfscore > (max_perfscore or float("-inf")):
                 max_perfscore = perfscore
                 best_task = task_name
         return best_task
@@ -387,14 +387,13 @@ class OnlineScheduler:
         """
         self.eta = eta
         # store mapping of job name to deficit counter
-        self.job_deficit = {}
+        self.job_deficit: dict[str, int] = dict()
         # same as task_data in values
         # mapping of jobs to task data in order to store other job information while trying to schedule one job at a time
         self.job_tasks: dict[str, dict[str, tuple[Any, ...]]] = {}
 
         # todo: define this
         self.cluster_capacity = machines
-        self.deficit_threshold = k * self.cluster_capacity
 
         # finished tasks, mapping of job to set of tasks
         self.finished: dict[str, set] = dict()
@@ -517,23 +516,19 @@ class OnlineScheduler:
 
             # if unfairness is too high, choose another job
             current_job = job_name
-            # if len(self.job_deficit) > 0:
-            #     job_most_deficit = max(self.job_deficit, key=self.job_deficit.get)
-            #     highest_deficit = self.job_deficit[job_most_deficit]
-            # else:
-            #     job_most_deficit = None
-            #     highest_deficit = None
-            #
-            # if highest_deficit is not None and highest_deficit >= self.deficit_threshold:
-            #     discriminated_task_perfscores = self.job_tasks[job_most_deficit]
-            #     best_task = machine.argmax_perfscore(job_most_deficit, discriminated_task_perfscores, self.eta)
-            #     current_job = job_most_deficit
+
+            if len(self.job_deficit) > 0:
+                # pyright is too stupid to understand this?
+                job_most_deficit = max(self.job_deficit, key=self.job_deficit.get)  # type: ignore
+                highest_deficit = self.job_deficit[job_most_deficit]
+                if self.deficit_threshold is not None and highest_deficit >= self.deficit_threshold:
+                    assert job_most_deficit is not None
+                    discriminated_task_perfscores = self.job_tasks[job_most_deficit]
+                    best_task = machine.argmax_perfscore(job_most_deficit, discriminated_task_perfscores, self.eta)
+                    current_job = job_most_deficit
 
             if best_task is None:
                 break
-
-            # if we scheduled a job, reset its deficit to 0
-            self.job_deficit[current_job] = 0
 
             best_task_data = self.job_tasks[current_job][best_task]
 
@@ -542,6 +537,9 @@ class OnlineScheduler:
             task_duration = best_task_data[3]
             # in hindsight, maybe I could've used Space, but this in theory should be faster
             if machine.resources_are_available(task_cpu, task_mem):
+                # if we scheduled a job, reset its deficit to 0
+                self.job_deficit[current_job] = 0
+
                 next_timestamp.append(task_duration + current_time)
                 scheduled.setdefault(current_job, set())
                 scheduled[current_job].add(best_task)
@@ -552,7 +550,9 @@ class OnlineScheduler:
                         self.job_deficit[j] += 1
                 # remove since we scheduled
                 del self.job_tasks[current_job][best_task]
-                tasks = list(filter(lambda t: t[0] != best_task, tasks))
+                if current_job != job_name:
+                    # fairness triggered, job name no longer matches
+                    tasks = list(filter(lambda t: t[0] != best_task, tasks))
                 # get rid of empty job deficits
                 if len(self.job_tasks[current_job]) == 0:
                     del self.job_deficit[current_job]
@@ -562,9 +562,8 @@ class OnlineScheduler:
                 break
         return scheduled, next_timestamp
 
-    def finish_rest(self, current_time: int, next_timestamps: set[int]):
+    def finish_rest(self, current_time: int):
         max_time = current_time + 100
-        self.next_timestamps.update(next_timestamps)
         # ideally this should be part of the schedule loop
         while len(self.next_timestamps) != 0:
             if max_time < min(self.next_timestamps):
@@ -597,6 +596,57 @@ class OnlineScheduler:
             machine_cpu_usage, machine_mem_usage = machine.usage
             self.timestamp_to_usage[current_time] = (self.timestamp_to_usage[current_time][0] + machine_cpu_usage, self.timestamp_to_usage[current_time][1] + machine_mem_usage)
             machine.log_usage(current_time)
+
+    def schedule_tasks_bunch(self, scheduleable_jobs: dict[str, list[tuple[str, tuple[Any, ...]]]], current_time: int, typ: str):
+        """
+        Run a bunch of jobs specified in a dictionary mapping from job name to task orderings
+
+        Returns a list of scheduled job names and a dictionary of job name to new task orderings (after running those jobs), and the next timestamp to consider
+        """
+        finished_jobs = set()
+        for job_name in scheduleable_jobs.keys():
+            if job_name in finished_jobs:
+                continue
+            task_ordering = scheduleable_jobs[job_name]
+            scheduled, next_timestamp = self.schedule_tasks_type(job_name, task_ordering, current_time, typ)
+
+            for scheduled_job, scheduled_tasks in scheduled.items():
+                # remove scheduled
+                leftover_task_ordering = list(filter(lambda t: t[0] not in scheduled_tasks, scheduleable_jobs[scheduled_job]))
+                if len(leftover_task_ordering) == 0:
+                    # since i cant update a dictionary while iterating, record jobs that are finished
+                    # this is necessary with fairness as other jobs that are not in the current iteration loop can be ran
+                    finished_jobs.add(scheduled_job)
+                else:
+                    # remove scheduled tasks
+                    # This alters the dictionary while iterating, so I must iterate over keys
+                    scheduleable_jobs[scheduled_job] = leftover_task_ordering
+
+            if next_timestamp:
+                self.next_timestamps.add(next_timestamp)
+
+            if typ.lower() == "fifo":
+                # enforce fifo order by running first job only
+                break
+        # remove scheduled jobs
+        for job_name in finished_jobs:
+            del scheduleable_jobs[job_name]
+            self.delete_finished(job_name)
+            self.remove_job_precedessor_tracker(job_name)
+        if len(self.next_timestamps) == 0:
+            # this can happen with slot fairness since once we force a job to be scheduled it is no longer guaranteed to have enough resources
+            next_timestamp = current_time + 1
+        else:
+            next_timestamp = min(self.next_timestamps)
+        self.next_timestamps = set(filter(lambda x: x > next_timestamp, self.next_timestamps))
+        return scheduleable_jobs, next_timestamp
+
+    def schedule_tasks_type(self, job_name: str, tasks: list[tuple[str, tuple[Any, ...]]], current_time: int, typ: str):
+        if typ.lower() == "fifo":
+            return self.schedule_tasks_fifo(job_name, tasks, current_time)
+        else:
+            return self.schedule_tasks(job_name, tasks, current_time)
+
     def schedule_tasks(self, job_name: str, tasks: list[tuple[str, tuple[Any, ...]]], current_time: int):
         """
         Schedule a set of tasks at a certain time
@@ -615,7 +665,6 @@ class OnlineScheduler:
 
         self.check_finished(current_time)
 
-        # logger.info(f'logging {current_time}')
         total_scheduled = dict()
         for machine in self.machines:
             # scheduleable = list(filter(lambda t: self.check_predecessors_old(job_name, t[1][4]) and t[0] not in self.finished.get(job_name, {}), tasks))
@@ -627,7 +676,6 @@ class OnlineScheduler:
             for j, scheduled_tasks in scheduled.items():
                 total_scheduled.setdefault(j, set())
                 total_scheduled[j].update(scheduled_tasks)
-            tasks = list(filter(lambda t: t[0] not in scheduled.get(job_name, set()), tasks))
         self.log_usage(current_time)
         # return new set of tasks that could not be ran yet, in order to schedule later
         if len(self.next_timestamps) > 0:
@@ -637,7 +685,7 @@ class OnlineScheduler:
             # no more timestamps left, probably implies everything in the current task list has no work left, return none
             next_timestamp = None
             # next_timestamp = current_time + 1
-        return total_scheduled, tasks, next_timestamp
+        return total_scheduled, next_timestamp
 
 
     def find_appropriate_tasks_for_machine_fifo(self, machine: Machine, job_name: str, tasks: list[tuple[str, tuple[Any, ...]]], current_time: int) -> tuple[dict, list]:
@@ -695,7 +743,6 @@ class OnlineScheduler:
             for j, scheduled_tasks in scheduled.items():
                 total_scheduled.setdefault(j, set())
                 total_scheduled[j].update(scheduled_tasks)
-            tasks = list(filter(lambda t: t[0] not in scheduled.get(job_name, set()), tasks))
         self.log_usage(current_time)
         # return new set of tasks that could not be ran yet, in order to schedule later
         if len(self.next_timestamps) > 0:
@@ -703,7 +750,7 @@ class OnlineScheduler:
             self.next_timestamps = set(filter(lambda x: x > next_timestamp, self.next_timestamps))
         else:
             next_timestamp = None
-        return total_scheduled, tasks, next_timestamp
+        return total_scheduled, next_timestamp
 
     @property
     def cluster_usage(self):
@@ -1454,202 +1501,71 @@ def test_stats():
         logger.info(f"job {to_schedule_job_name} with start time {start_time} has end time {trace_end_times[to_schedule_job_name]}")
 
 
-def test_multiple_online():
-    online = OnlineScheduler(1, 9600, 100, 0.1, 1, 1, 10)
+def test_multiple_online(options: argparse.Namespace):
+    typ = options.typ
+    online = OnlineScheduler(1, 9600, 100, 0.1, 1, 1, deficit_threshold=10)
 
-    current_time = None
-    all_scheduled = dict()
     scheduleable_jobs = dict()
-    next_timestamps = set()
 
-    starting_time = 0
+    def load_job_dags(retime: bool=True):
+        starting_time = 0
+        to_schedule = deque()
+        task_dependencies = dict()
+        for i in range(1):
+            path = f"scheduler_data/offline/offline_job_dags_{i}.pkl"
+            if not os.path.exists(path):
+                logger.info(f"path {path} does not exist")
+                break
+            with open(path, "rb") as f:
+                new_to_schedule, new_task_dependencies = pickle.load(f)
 
-    to_schedule = deque()
-    task_dependencies = dict()
-    for i in range(1):
-        path = f"scheduler_data/offline/offline_job_dags_{i}.pkl"
-        if not os.path.exists(path):
-            logger.info(f"path {path} does not exist")
-            break
-        with open(path, "rb") as f:
-            new_to_schedule, new_task_dependencies = pickle.load(f)
+            to_schedule += new_to_schedule
+            task_dependencies.update(new_task_dependencies)
+            if retime:
+                to_schedule, starting_time = retime_offline_jobs(to_schedule, 5, starting_time)
+        
+            logger.info(f"reading path {path} with {len(to_schedule)} jobs")
+        return to_schedule, task_dependencies
 
-        to_schedule += new_to_schedule
-        task_dependencies.update(new_task_dependencies)
-        to_schedule, starting_time = retime_offline_jobs(to_schedule, 5, starting_time)
-    
-        logger.info(f"reading path {path} with {len(to_schedule)} jobs")
+    to_schedule, task_dependencies = load_job_dags(retime=False)
 
-    new_schedule = deque()
     # I forgot to preprocess for duplicates in the job dags, remove duplicates here
-    seen = set()
-    for item in to_schedule:
-        if item[1] not in seen:
-            seen.add(item[1])
-            new_schedule.append(item)
-    to_schedule = new_schedule
+    def remove_duplicates(schedule: deque):
+        new_schedule = deque()
+        seen = set()
+        for item in schedule:
+            if item[1] not in seen:
+                seen.add(item[1])
+                new_schedule.append(item)
+        return new_schedule
+    to_schedule = remove_duplicates(to_schedule)
     for job_name, task_dep_info in task_dependencies.items():
         for task_name, task_dep in task_dep_info.items():
             online.add_predecessors_for_job(job_name, task_name, task_dep)
 
+    current_time = to_schedule[0][0]
     while True:
         if len(to_schedule) == 0 and len(scheduleable_jobs) == 0:
             break
-        # logger.info(f"timestamp {current_time} with {len(scheduleable_jobs)} scheduled")
         if len(to_schedule) > 0:
-            if current_time is None:
-                current_time = to_schedule[0][0]
-            next_timestamps.add(to_schedule[0][0])
+            online.next_timestamps.add(to_schedule[0][0])
             if current_time >= to_schedule[0][0]:
                 _, to_schedule_job_name, to_schedule_task_ordering = to_schedule.popleft()
-                # if current_time != 80000:
-                    # temp, get rid of 0 start times
                 scheduleable_jobs[to_schedule_job_name] = to_schedule_task_ordering
-        scheduled_jobs = []
-        new_task_orderings = dict()
         if len(scheduleable_jobs) == 0:
             # this is some crappy workaround that I have to do since I just realized a bug when there are no tasks to schedule but running tasks can end
             # this doesnt actually affect the scheduler in any way but affects the logging
             online.check_finished(current_time)
             online.log_usage(current_time)
-        for i, (job_name, task_ordering) in enumerate(scheduleable_jobs.items()):
-            try:
-                scheduled, leftover_task_ordering, next_timestamp = online.schedule_tasks(job_name, task_ordering, current_time)
-            except:
-                print(job_name)
-                raise
-
-            for j, scheduled_tasks in scheduled.items():
-                all_scheduled.setdefault(j, set())
-                all_scheduled[j].update(scheduled_tasks)
-            if next_timestamp:
-                next_timestamps.add(next_timestamp)
-
-            if len(leftover_task_ordering) == 0:
-                scheduled_jobs.append(job_name)
-            else:
-                new_task_orderings[job_name] = leftover_task_ordering
-            # remove scheduled tasks
-        logger.info(f"cluster usage {online.timestamp_to_usage[current_time]} as timestamp {current_time}")
-        current_time = min(next_timestamps)
-        next_timestamps = set(filter(lambda x: x > current_time, next_timestamps))
-        for job_name, leftover_task_ordering in new_task_orderings.items():
-            scheduleable_jobs[job_name] = leftover_task_ordering
-        for job_name in scheduled_jobs:
-            del scheduleable_jobs[job_name]
-            online.delete_finished(job_name)
-            online.remove_job_precedessor_tracker(job_name)
+        old_time = current_time
+        scheduleable_jobs, current_time = online.schedule_tasks_bunch(scheduleable_jobs, current_time, typ)
+        logger.info(f"cluster usage {online.timestamp_to_usage[old_time]} as timestamp {current_time}")
 
     logger.info('finishing')
-    online.finish_rest(current_time, next_timestamps)
+    online.finish_rest(current_time)
 
-    online.plot_cluster_usage('graphene_utilization.png')
-
-def test_multiple_online_fifo():
-    # messy, but itll do the trick
-    online = OnlineScheduler(1, 9600, 100, 0.1, 1, 1, 10)
-
-    current_time = None
-    all_scheduled = dict()
-    scheduleable_jobs = dict()
-    schedule_time = 0
-    next_timestamps = set()
-
-    rng = np.random.default_rng(10)
-    starting_time = 0
-
-    iterations_nothing_schedule = 0
-
-    to_schedule = deque()
-    task_dependencies = dict()
-    for i in range(1):
-        path = f"scheduler_data/offline/offline_job_dags_{i}.pkl"
-        if not os.path.exists(path):
-            logger.info(f"path {path} does not exist")
-            break
-        with open(path, "rb") as f:
-            new_to_schedule, new_task_dependencies = pickle.load(f)
-
-        to_schedule += new_to_schedule
-        task_dependencies.update(new_task_dependencies)
-        to_schedule, starting_time = retime_offline_jobs(to_schedule, 5, starting_time)
-
-        logger.info(f"reading path {path} with {len(to_schedule)} jobs")
-
-    new_schedule = deque()
-    # I forgot to preprocess for duplicates in the job dags, remove duplicates here
-    seen = set()
-    for item in to_schedule:
-        if item[1] not in seen:
-            seen.add(item[1])
-            new_schedule.append(item)
-    to_schedule = new_schedule
-
-    for job_name, task_dep_info in task_dependencies.items():
-        for task_name, task_dep in task_dep_info.items():
-            online.add_predecessors_for_job(job_name, task_name, task_dep)
-    while True:
-        if iterations_nothing_schedule > 100:
-            logger.info(f"warning, nothing has been scheduleable for a while, currently at timestamp {current_time}")
-        if len(to_schedule) == 0 and len(scheduleable_jobs) == 0:
-            break
-        if len(to_schedule) > 0:
-            if current_time is None:
-                current_time = to_schedule[0][0]
-            next_timestamps.add(to_schedule[0][0])
-            if current_time >= to_schedule[0][0]:
-                _, to_schedule_job_name, to_schedule_task_ordering = to_schedule.popleft()
-                to_schedule_task_ordering = rng.permutation(np.array(to_schedule_task_ordering, dtype=object))
-                # if current_time != 80000:
-                    # temp, get rid of 0 start times
-                scheduleable_jobs[to_schedule_job_name] = to_schedule_task_ordering
-        scheduled_jobs = []
-        new_task_orderings = dict()
-        if len(scheduleable_jobs) == 0:
-            # this is some crappy workaround that I have to do since I just realized a bug when there are no tasks to schedule but running tasks can end
-            # this doesnt actually affect the scheduler in any way but affects the logging
-            online.check_finished(current_time)
-            online.log_usage(current_time)
-
-        for i, (job_name, task_ordering) in enumerate(scheduleable_jobs.items()):
-            if i > 0:
-                # enforce FIFO order
-                break
-            try:
-                scheduled, leftover_task_ordering, next_timestamp = online.schedule_tasks_fifo(job_name, task_ordering, current_time)
-            except:
-                print(job_name)
-                raise
-
-            for j, scheduled_tasks in scheduled.items():
-                all_scheduled.setdefault(j, set())
-                all_scheduled[j].update(scheduled_tasks)
-
-            if len(scheduled) == 0 and len(to_schedule) == 0:
-                iterations_nothing_schedule += 1
-            else:
-                iterations_nothing_schedule = 0
-            if next_timestamp:
-                next_timestamps.add(next_timestamp)
-
-            if len(leftover_task_ordering) == 0:
-                scheduled_jobs.append(job_name)
-            else:
-                new_task_orderings[job_name] = leftover_task_ordering
-        logger.info(f"cluster usage {online.timestamp_to_usage[current_time]} as timestamp {current_time}")
-        # remove scheduled tasks
-        current_time = min(next_timestamps)
-        next_timestamps = set(filter(lambda x: x > current_time, next_timestamps))
-        for job_name, leftover_task_ordering in new_task_orderings.items():
-            scheduleable_jobs[job_name] = leftover_task_ordering
-        for job_name in scheduled_jobs:
-            del scheduleable_jobs[job_name]
-            online.delete_finished(job_name)
-            online.remove_job_precedessor_tracker(job_name)
-
-    online.finish_rest(current_time, next_timestamps)
-
-    online.plot_cluster_usage('fifo_utilization.png')
+    output_path = f"{typ.lower()}_utilization.png"
+    online.plot_cluster_usage(output_path)
 
 
 def main(args=None):
@@ -1659,6 +1575,7 @@ def main(args=None):
     parser.add_argument("--skip", action="store_true", default=False)
     parser.add_argument("--operation", "-o", default=None)
     parser.add_argument("--skip-amt", type=int, default=None)
+    parser.add_argument("--typ", "-t", default="graphene")
     options = parser.parse_args(args)
 
     output_file = os.path.join("scheduler_data", "last_job_timestamps.csv")
@@ -1677,9 +1594,7 @@ def main(args=None):
     elif options.operation == "offline_graphene":
         run_offline_graphene()
     elif options.operation == "multiple_online":
-        test_multiple_online()
-    elif options.operation == "multiple_online_fifo":
-        test_multiple_online_fifo()
+        test_multiple_online(options)
     elif options.operation == "fix_offline":
         fix_offline_dags()
     elif options.operation == "test":
